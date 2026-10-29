@@ -1,12 +1,20 @@
 (import srfi-1)
+(import srfi-18)
 (import scheme.char)
 (import scheme.base)
 (import chicken.string)
 (import chicken.bitwise)
 (import chicken.sort)
 (import miscmacros)
-(import comparse)
 (import raylib)
+(import deterministic-threads)
+
+(import (prefix comparse comparse:)) ;; we can't have stuff like "is" and "char-seq" binded to this
+
+(deterministic-threads #t) ;; <3
+
+(load "com.so")
+(import com)
 
 (define MEMORY_S #x000)
 (define MEMORY_X #x400)
@@ -21,8 +29,8 @@
              instruction-list1->sym
   CMDFNC CMDP  LD    LDI   
   AND    ANI   OR    ORI 
-  ERR    ERR   ERR   ERR 
-  OUTYM  SETYM RSTYM CMDCH)
+  EXTEND ERR   ERR   ERR 
+  OUT    SET   RST CMDCH)
 
 (define-enum instruction-list-cmdch->int 
              instruction-list-cmdch->sym
@@ -31,10 +39,13 @@
   ANB ORB MPS MRD 
   MPP INV ERR RET)
 
+;; NOTE: 0142 is the sum of the 8000 program words (actual sum is 4201) (remember to byte swap the words)
+
+(define *program* (list))
 
 (define (plc-location->string loc)
   (cond 
-    [(>= loc MEMORY_M8xxx) (string-append "M80" (number->string (- loc MEMORY_M8xxx)))] ;; is this right?
+    [(>= loc MEMORY_M8xxx) (string-append "M" (number->string (+ 8000 (- loc MEMORY_M8xxx))))] ;; is this right?
     [(>= loc MEMORY_C) (string-append "C" (number->string (- loc MEMORY_C)))]
     [(>= loc MEMORY_M) (string-append "M" (number->string (- loc MEMORY_M)))]
     [(>= loc MEMORY_T) (string-append "T" (number->string (- loc MEMORY_T)))]
@@ -42,38 +53,99 @@
     [(>= loc MEMORY_X) (string-append "X" (number->string (- loc MEMORY_X)))]
     [(>= loc MEMORY_S) (string-append "S" (number->string (- loc MEMORY_S)))]))
 
+
+(define (string->program-words str)
+  (define (swap x) (list (second x) (first x)))
+  (define (lst-pairs lst)
+    (if (null? lst)
+      (list)
+      (cons (take lst 2) (lst-pairs (drop lst 2)))))
+  (let* ([lst (string->list str)]
+         [bytes (lst-pairs lst)]
+         [word-pairs (map swap (lst-pairs bytes))]
+         [word-strings (map list->string (map concatenate word-pairs))]
+         [words (map (cut string->number <> 16) word-strings)])
+    words))
+
 (define hex (string->vector "0123456789ABCDEF"))
 
+(define (compute-program-checksum program-str max-steps)
+  (define words (string->program-words program-str))
+  (define sum (apply + (* (- max-steps (length words)) #xffff) words))
+  (define x1 (bitwise-and #xf (arithmetic-shift sum -12)))
+  (define x2 (bitwise-and #xf (arithmetic-shift sum -8)))
+  (define x3 (bitwise-and #xf (arithmetic-shift sum -4)))
+  (define x4 (bitwise-and #xf (arithmetic-shift sum 0)))
+  (list->string (map (cut vector-ref hex <>) (list x3 x4 x1 x2))))
+
+(define (compute-program-header program-str max-steps)
+  (string-append "0800" (compute-program-checksum program-str max-steps) 
+                 "0000000020202020202020202020202020202020202020202020202020202020202020202020202020202020F409FF0BF401E703640EC70EDC0EFF0E9001FE03000000000000000000000000000000000000000000000000" ))
+
 (define (write-byte b)
-  (display (vector-ref hex (arithmetic-shift b -4)))
-  (display (vector-ref hex (bitwise-and b #x0f))))
+  (push! (vector-ref hex (arithmetic-shift b -4)) *program*)
+  (push! (vector-ref hex (bitwise-and b #x0f)) *program*))
 
 (define (write-word b1 b2)
   (write-byte b2)
   (write-byte b1))
 
 (define (write-instruction1 op n)
-  (let* ([op (list (arithmetic-shift op 4) #x00)]
+  (define opcode (instruction-list1->int op))
+  (let* ([op (list (arithmetic-shift opcode 4) #x00)]
          [nn (list (arithmetic-shift n -8) (bitwise-and n #xff))])
     (apply write-word (map bitwise-ior op nn))))
 
 (define (write-instruction-cmch cmd)
-  (write-instruction1 CMDCH (bitwise-ior #xff0 cmd)))
+  (define cmdcode (instruction-list-cmdch->int cmd))
+  (write-instruction1 'CMDCH (bitwise-ior #xff0 cmdcode)))
 
-(define (write-out-tk t k)
-  (write-instruction1 CMDFNC (+ #x600 t))
+(define (write-extended-out loc k)
+  (write-instruction1 'CMDFNC loc)
   (write-word #x80 (bitwise-and k #x0f))
   (write-word #x80 (arithmetic-shift k -8)))
 
-(define (write-out-ck c k)
-  (write-instruction1 CMDFNC (+ #xe00 c))
-  (write-word #x80 (bitwise-and k #x0f))
-  (write-word #x80 (arithmetic-shift k -8)))
+(define (write-rst-tc loc)
+  (write-instruction1 'CMDFNC #x0c)
+  (write-instruction1 'EXTEND loc))
+
+(define (write-pls loc)
+  (write-instruction1 'CMDFNC #x08)
+  (write-instruction1 'EXTEND loc))
+
+(define (write-plf loc)
+  (write-instruction1 'CMDFNC #x09)
+  (write-instruction1 'EXTEND loc))
+
+(define (write-end)
+  (write-instruction1 'CMDFNC #x0f))
+
+(define (write-instruction instr)
+  (case (car instr)
+    ([LD LDI AND ANI OR ORI SET] 
+     (write-instruction1 (first instr) (second instr)))
+    ([STL ANB ORB MPS MRD MPP INV RET]
+     (write-instruction-cmch (first instr)))
+    ([OUT]
+     (if (>= (length instr) 3)
+       (write-extended-out (second instr) (second (third instr)))
+       (write-instruction1 'OUT (second instr))))
+    ([RST]
+     (let ([loc-type (car (string->list (plc-location->string (second instr))))])
+       (if (or (eqv? loc-type #\C) (eqv? loc-type #\T))
+         (write-rst-tc (second instr))
+         (write-instruction1 'RST (second instr)))))
+    ([END] (write-end))
+    ([PLS] (write-pls (second instr)))
+    ([PLF] (write-plf (second instr)))))
+
+(define (write-program-string program)
+  (set! *program* (list))
+  (for-each write-instruction program)
+  (list->string (reverse *program*)))
 
 (define current-high #x00)
 (define current-low #x00)
-
-(define *program* #f)
 
 (define (pop-byte!)
   (let ([high (string->number (string (pop! *program*)) 16)]
@@ -90,25 +162,43 @@
 (define (read-instruction-cmdch op p) 
   (list (instruction-list-cmdch->sym (bitwise-and p #x0f))))
 
+(define (read-constant!)
+  (define low 0)
+  (define high 0)
+  (pop-instruction!)
+  (set! low current-low)
+  (pop-instruction!)
+  (set! high current-low)
+  (+ low (arithmetic-shift high 8)))
+
 (define (read-instruction-out-tk t)
-  (pop-instruction!)
-  (pop-instruction!)
-  (list 'OUTTK t))
+  (list 'OUT t (list #\K (read-constant!))))
 
 (define (read-instruction-out-ck t)
-  (pop-instruction!)
-  (pop-instruction!)
-  (list 'OUTCK t))
+  (list 'OUT t (list #\K (read-constant!))))
+
+(define (instruction-p)
+  (+ (arithmetic-shift (bitwise-and current-high #x0f) 8) current-low))
 
 (define (read-instruction-cmdfnc op p) 
   (cond 
+    ([= p #x0f] (list 'END))
+    ([= p #x08] 
+     (pop-instruction!) 
+     (list 'PLS (instruction-p)))
+    ([= p #x09] 
+     (pop-instruction!) 
+     (list 'PLF (instruction-p)))
+    ([= p #x0c] 
+     (pop-instruction!) 
+     (list 'RST (instruction-p)))
     ([<= #x600 p #x7ff] (read-instruction-out-tk p))
     ([<= #xe00 p #xeff] (read-instruction-out-ck p))
     (else (list (instruction-list1->sym op) p))))
 
 (define (read-instruction)
   (let ([op (arithmetic-shift current-high -4)]
-        [p (+ (arithmetic-shift (bitwise-and current-high #x0f) 8) current-low)])
+        [p (instruction-p)])
     (case (instruction-list1->sym op)
       ([CMDFNC] (read-instruction-cmdfnc op p ))
       ([CMDCH] (read-instruction-cmdch op p ))
@@ -316,7 +406,11 @@
           ))
       )))
 
-(define parsed-program (read-program-string "00340164FAFF0144026403C500C5FCFF034401C5"))
+;(define parsed-program (read-program-string "00340164FAFF0144026403C500C5FCFF034401C5"))
+(define parsed-program (read-program-string "022400C50025000602800080002601C50125000E03800080002E02C5002E025400D8002802440C00008E00E80F00"))
+
+;; out: 022400C50025000602800080002601C50125000E03800080002E02C5002E025400D8002802440C00008E00E80F00
+;;      022400C50025000602800080002601C50125000E03800080002E02C5002E025400D8002802440C00008E00E80F00
 
 (define graph (program->graph parsed-program))
 (define graph-names (first graph))
@@ -327,8 +421,12 @@
 (define x-values (alist-cons graph-end 10 (compute-x-values graph-edges)))
 (define y-values (compute-y-values graph-edges))
 
-(define bg-color (color 0 0 200 255))
-(define terminal-color (color 0 0 100 255))
+;; (define bg-color (color 0 0 170 255))
+;; (define terminal-color (color 0 0 100 255))
+
+(define bg-color (color 0 0 0 255))
+(define terminal-color (color 0 0 0 255))
+(define terminal-select-color (color 100 0 0 255))
 
 (define (edge-points edge y-value)
   (list (make-vec2 (cdr (assoc (car edge) x-values)) y-value)
@@ -360,20 +458,40 @@
     ([#\C] (+ MEMORY_C i))
     (else #x00)))
 
-(define tokens1 (list "LDI" "LD" "AND" "ANI" "ORI" "OR" "OUT" "SET" "RST"))
-(define tokens2 (list "STL" "ANB" "ORB" "MPS" "MRD" "MPP" "INV" "RET"))
+(define tokens1 (list "LDI" "LD" "AND" "ANI" "ORI" "OR" "OUT" "SET" "RST" "PLS" "PLF"))
+(define tokens2 (list "STL" "ANB" "ORB" "MPS" "MRD" "MPP" "INV" "RET" "END"))
 
 (define (string->program str)
-  (define whitespace (zero-or-more (is #\space)))
-  (define number (bind (as-string (one-or-more (satisfies char-numeric?))) (lambda (s) (result (string->number s)))))
-  (define (token-parser str) (bind (char-seq str) (lambda (s) (result (string->symbol s)))))
-  (define plc-location0 (sequence (any-of (map is (list #\S #\X #\Y #\T #\M #\C))) number))
-  (define plc-location (bind plc-location0 (lambda (x) (result (->plc-location (first x) (second x))))))
-  (define instruction1 (sequence (any-of (map token-parser tokens1)) (preceded-by whitespace plc-location)))
-  (define instruction2 (sequence (any-of (map token-parser tokens2))))
-  (define instruction (preceded-by whitespace (any-of instruction1 instruction2)))
-  (define program (zero-or-more instruction))
-  (parse program str))
+  (define whitespace (comparse:zero-or-more (comparse:is #\space)))
+  (define number 
+    (comparse:bind 
+      (comparse:as-string (comparse:one-or-more (comparse:satisfies char-numeric?))) 
+      (lambda (s) (comparse:result (string->number s)))))
+  (define (token-parser str) 
+    (comparse:bind 
+      (comparse:char-seq str) 
+      (lambda (s) (comparse:result (string->symbol s)))))
+  (define plc-location0 
+    (comparse:sequence (comparse:any-of (map comparse:is (list #\S #\X #\Y #\T #\M #\C))) number))
+  (define plc-constant (comparse:sequence (comparse:is #\K) number))
+  (define plc-location 
+    (comparse:bind 
+      plc-location0 
+      (lambda (x) (comparse:result (->plc-location (first x) (second x))))))
+  (define instruction1 
+    (comparse:sequence 
+      (comparse:any-of (map token-parser tokens1)) 
+      (comparse:preceded-by whitespace plc-location)))
+  (define instruction2 (comparse:sequence (comparse:any-of (map token-parser tokens2))))
+  (define instruction3 
+    (comparse:sequence 
+      (token-parser "OUT") 
+      (comparse:preceded-by whitespace plc-location) 
+      (comparse:preceded-by whitespace plc-constant)))
+  (define instruction 
+    (comparse:preceded-by whitespace (comparse:any-of instruction3 instruction1 instruction2)))
+  (define program (comparse:zero-or-more instruction))
+  (comparse:parse program str))
 
 
 (define (draw-contact name x y)
@@ -388,12 +506,27 @@
        (draw-rectangle (- x 5) (- y 7) 10 14 bg-color)
        (draw-line-ex (make-vec2 (- x 3) (+ y 3)) (make-vec2 (+ x 3) (- y 3)) 2 WHITE))
      )
-    (else
-      (begin
-        (draw-circle x y 8 WHITE)
-        (draw-circle x y 7 bg-color))))
+    ([OUT]
+     (begin
+       (draw-rectangle (- x 20) (- y 5) 40 10 bg-color)
+       (draw-text-ex font "(   )" (make-vec2 (- x 20) (- y 8)) 16 0 WHITE)))
+    ([SET]
+     (begin
+       (draw-rectangle (- x 20) (- y 5) 40 10 bg-color)
+       (draw-text-ex font "(SET)" (make-vec2 (- x 20) (- y 8)) 16 0 WHITE)))
+    ([END]
+     (begin
+       (draw-rectangle (- x 20) (- y 5) 40 10 bg-color)
+       (draw-text-ex font "(END)" (make-vec2 (- x 20) (- y 8)) 16 0 WHITE)))
+    ([RST]
+     (begin
+       (draw-rectangle (- x 20) (- y 5) 40 10 bg-color)
+       (draw-text-ex font "(RST)" (make-vec2 (- x 20) (- y 8)) 16 0 WHITE))))
   (unless (null? (cdr name))
-    (draw-text-ex font (plc-location->string (second name)) (make-vec2 (- x 20) (- y 25)) 16 0 WHITE)))
+    (draw-text-ex font (plc-location->string (second name)) (make-vec2 (- x 20) (- y 25)) 16 0 WHITE))
+  (when (>= (length name) 3)
+    (draw-text-ex font (string-append "K" (number->string (second (third name)))) (make-vec2 (- x 20) (+ y 8)) 16 0 WHITE))
+  )
 
 (define (draw-edge name edge y-value)
   (let* ([points (edge-points edge y-value)]
@@ -436,6 +569,11 @@
 
 (define (draw-terminal)
   (draw-rectangle-rec terminal-rec terminal-color)
+  (let ([x (+ (rect-x terminal-rec) 20)]
+        [y (+ (rect-y terminal-rec) (* 20 current-line) 20)]
+        [w (- (rect-w terminal-rec) 40)]
+        [h 14])
+    (draw-rectangle-rec (margin-rec (make-rect x y w h) -2) terminal-select-color))
   (for-each
     (lambda (line line-number)
       (let ([x (+ (rect-x terminal-rec) 20)]
@@ -443,14 +581,14 @@
             [w (- (rect-w terminal-rec) 40)]
             [h 14]
             [str (apply string-append (intersperse (map (cut format-string-spacing <> 5) (string-split line)) " "))])
-        (when (= line-number current-line)
-          (draw-rectangle-rec (margin-rec (make-rect x y w h) -2) bg-color))
         (draw-text-ex font str (make-vec2 x y) 16 0 WHITE)))
     terminal-lines (iota (length terminal-lines)))
   )
 
 
 (define input-handler #f)
+(define draw-handler #f)
+(define byte-counter 0)
 
 (define (parse-terminal-lines!)
   (handle-exceptions exn
@@ -500,6 +638,7 @@
   (when (key-pressed? KEY_D) (delete-line))
   (when (key-pressed? KEY_I) (edit-line))
   (when (key-pressed? KEY_A) (edit-line))
+  (when (key-pressed? KEY_F1) (start-upload-program))
   )
 
 (define (input-edit-mode)
@@ -524,30 +663,111 @@
       (list-set! terminal-lines current-line (string-append edited-line "_"))
       (loop (integer->char (get-char-pressed))))))
 
-(define (draw)
-  (with-drawing
-    (lambda ()
-      (clear-background bg-color)
-      (draw-line-ex (make-vec2 50 0) (make-vec2 50 500) 2 WHITE)
-      (draw-line-ex (make-vec2 (* 50 11) 0) (make-vec2 (* 50 11) 500) 2 WHITE)
-      (for-each draw-edge graph-names graph-edges y-values)
-      (for-each draw-node-verticals (graph-nodes graph-edges))
-      (draw-terminal)
-      )))
+(define tick 0)
+
+(define (draw-ladder)
+  (clear-background bg-color)
+  (draw-text (number->string tick) 0 0 20 WHITE)
+  (draw-line-ex (make-vec2 50 0) (make-vec2 50 500) 2 WHITE)
+  (draw-line-ex (make-vec2 (* 50 11) 0) (make-vec2 (* 50 11) 500) 2 WHITE)
+  (for-each draw-edge graph-names graph-edges y-values)
+  (for-each draw-node-verticals (graph-nodes graph-edges))
+  (draw-terminal))
+
+(define (compute-checksum payload) 
+  (define sum (apply + #x03 payload))
+  (define hex (number->string (bitwise-and sum #xff) 16))
+  (map (o char->integer char-upcase) (string->list hex)))
+
+
+(define (await-com-byte)
+  (let ([byte (com-read-byte)])
+    (if (= byte -1)
+      (begin
+        (thread-yield!)
+        (await-com-byte))
+      byte)))
+
+(define (receive-response)
+  (define (receive-payload)
+    (let loop ([lst (list)])
+      (let ([byte (await-com-byte)])
+        (if (= byte #x03)
+          (reverse lst)
+          (loop (cons byte lst)))
+        )))
+  (define (receive-packet)
+    (let* ([payload (receive-payload)]
+           [expected-checksum (compute-checksum payload)]
+           [checksum1 (await-com-byte)]
+           [checksum2 (await-com-byte)])
+      (unless (every = expected-checksum (list checksum1 checksum2))
+        (print "invalid checksum: " checksum1 " " checksum2 " is not expected " expected-checksum))
+      payload))
+  (let loop ()
+    (case (await-com-byte)
+      ([#x02] (receive-packet))
+      ([#x06] 'ACK)
+      ([#x15] 'NACK)
+      (else => identity))))
+
+(define (send-enquiry)
+  (com-write (bytevector #x05) 1)
+  (case (await-com-byte)
+    ([#x06] 'ACK)
+    ([#x15] 'NACK)
+    (else => identity)))
+
+(define (send-command payload)
+  (define bytes (apply bytevector (append (list #x02) payload (list #x03) (compute-checksum payload))))
+  (com-write bytes (bytevector-length bytes))
+  (inc! byte-counter (bytevector-length bytes))
+  (receive-response))
+
+(define (send-command-str payload-str)
+  (define response (send-command (map char->integer (string->list payload-str))))
+  (list->string (map integer->char response)))
+
+(define (async-upload-program)
+  (repeat 200
+    (thread-sleep! (/ 320 9600))
+    (inc! byte-counter 40))
+  (enable-event-waiting)
+  (set! input-handler input-normal-mode)
+  (set! draw-handler draw-ladder))
+
+(define (start-upload-program)
+  (set! byte-counter 0)
+  (set! input-handler void)
+  (set! draw-handler draw-menu1)
+  (disable-event-waiting)
+  (thread-start! async-upload-program))
+
+(define (draw-menu1)
+  (define (line y str)
+    (draw-text-ex font str
+                  (make-vec2 106 (+ 106 (* 20 y))) 16 0 WHITE))
+  (clear-background bg-color)
+  (draw-rectangle 100 100 600 300 WHITE)
+  (draw-rectangle 102 102 596 296 bg-color)
+  (line 0 (string-append "UPLOADING. " (number->string byte-counter) " BYTES"))
+  )
 
 (define (gui)
-  (init-window 800 500 "plc")
+  (init-window 800 500 "fx1n")
 
   (set! font (load-font "vga.ttf"))
   (set! input-handler input-normal-mode)
-  (draw)
+  (set! draw-handler draw-ladder)
+  (enable-event-waiting)
+  (set-exit-key KEY_NULL)
 
   (let loop ()
+    (inc! tick)
     (input-handler)
-    (if (= (get-key-pressed) KEY_NULL)
-      (with-drawing (lambda () #f))
-      (draw))
-    (unless (and (window-should-close?) (not (key-pressed? KEY_ESCAPE)))
+    (with-drawing draw-handler)
+    (unless (and (window-should-close?))
+      (thread-yield!)
       (loop)))
 
   (close-window))
