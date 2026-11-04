@@ -30,11 +30,15 @@ SUBSYSTEM=="tty", ATTRS{idVendor}=="067b", ATTRS{idProduct}=="23a3", ACTION=="ad
 ```
 where the vendor and product id's are from `lsusb` output for your device.
 
-## Bulding
+## Building
 ```
 $ csc -s fx1n.scm -j fx1n
 $ csc cli.scm
 $ csc ladder.scm
+```
+or for just CLI
+```
+$ chicken-install
 ```
 
 ## CLI

@@ -1,0 +1,15 @@
+((author "Meowster")
+ (version "1.0")
+ (license "MIT")
+ (category graphics)
+ (dependencies
+   srfi-1
+   srfi-13
+   miscmacros
+   comparse)
+ (components 
+   (extension fx1n)
+   (program cli
+     (install-name "fx1n")
+     (component-dependencies fx1n)))
+ )
