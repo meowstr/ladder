@@ -1,0 +1,5 @@
+LDI  X0
+OUT  T1   K100
+LD   T1
+OUT  Y0
+END

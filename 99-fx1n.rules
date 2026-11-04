@@ -1,0 +1,1 @@
+SUBSYSTEM=="tty", ATTRS{idVendor}=="067b", ATTRS{idProduct}=="23a3", ACTION=="add", RUN+="/bin/sh -c '/bin/stty -F /dev/%k 9600 raw -cstopb evenp'"
